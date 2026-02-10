@@ -1,0 +1,7 @@
+{
+    "control_bot_token": "YOUR_BOT_TOKEN_HERE",
+    "admin_user_ids": [123456789],
+    "max_messages_per_day": 100,
+    "default_delay_seconds": 30,
+    "trial_duration_hours": 24
+}
