@@ -1,17 +1,20 @@
-# Use the official Python image
-FROM python:3.9
+FROM python:3.9-slim
 
-# Salin semua file ke dalam container
+WORKDIR /app
+
+# Install dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application files
 COPY . .
 
-# Instal dependensi dari requirements.txt
-RUN pip install -r requirements.txt
+# Create necessary directories
+RUN mkdir -p sessions
 
-# Copy the rest of the application code
-COPY . .
-
-# Expose the port Flask runs on (adjust if needed for your app)
+# Expose ports
+EXPOSE 5000
 EXPOSE 8000
 
-# Run the Flask app and bot
-CMD ["sh", "-c", "python web.py & python main.py"]
+# Run application
+CMD ["python", "main.py"]
