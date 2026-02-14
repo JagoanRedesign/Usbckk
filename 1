@@ -1,0 +1,148 @@
+// ==================== KONFIGURASI ====================
+const CONFIG = {
+  API_URL: 'https://vivid-sydelle-jamaa-c03b69c9.koyeb.app',
+  API_KEY: 'kunci975635885rii7',
+  GAME_NAME: 'susunkata',
+  SHEET_ID: '14yci2PN7PzwmTG-x-hN2Ek3laiBmrA0iiav2EBFEO1U',
+  SHEET_NAME: 'Leaderboard',
+  START_ROW: 2,
+  COL_USER_ID: 1,
+  COL_NAMA: 2,
+  COL_POIN: 3,
+};
+
+// ==================== FUNGSI UTAMA (UNTUK RUN DI EDITOR) ====================
+function runImportFromEditor() {
+  try {
+    Logger.log('🚀 Mulai import dari editor...');
+    
+    // 1. Baca data
+    Logger.log('📖 Membaca data...');
+    const players = readSheet();
+    Logger.log(`✅ ${players.length} pemain ditemukan`);
+    
+    if (players.length === 0) {
+      Logger.log('❌ Tidak ada data');
+      return;
+    }
+    
+    // 2. Preview 5 data pertama
+    Logger.log('📋 Preview 5 data pertama:');
+    players.slice(0, 5).forEach((p, i) => {
+      Logger.log(`   ${i+1}. ${p.user_id} | ${p.first_name} | ${p.points}`);
+    });
+    
+    // 3. Hitung total poin
+    const totalPoin = players.reduce((sum, p) => sum + p.points, 0);
+    Logger.log(`📊 Total poin: ${totalPoin}`);
+    Logger.log(`📊 Rata-rata: ${(totalPoin/players.length).toFixed(1)}`);
+    
+    // 4. Konfirmasi via log
+    Logger.log('⚠️ Untuk melanjutkan import, jalankan fungsi importToAPI()');
+    
+  } catch (e) {
+    Logger.log('❌ Error: ' + e.toString());
+  }
+}
+
+// ==================== FUNGSI IMPORT KE API ====================
+function importToAPI() {
+  try {
+    Logger.log('📤 Membaca data dari sheet...');
+    const players = readSheet();
+    Logger.log(`✅ ${players.length} pemain akan diimport`);
+    
+    Logger.log('📤 Mengirim ke API...');
+    const result = sendToAPI(players);
+    
+    Logger.log('✅ HASIL:');
+    Logger.log(JSON.stringify(result, null, 2));
+    
+  } catch (e) {
+    Logger.log('❌ Error: ' + e.toString());
+  }
+}
+
+// ==================== BACA SHEET ====================
+function readSheet() {
+  const ss = SpreadsheetApp.openById(CONFIG.SHEET_ID);
+  const sheet = ss.getSheetByName(CONFIG.SHEET_NAME);
+  
+  if (!sheet) {
+    throw new Error('Sheet "' + CONFIG.SHEET_NAME + '" tidak ditemukan');
+  }
+  
+  const lastRow = sheet.getLastRow();
+  if (lastRow < CONFIG.START_ROW) return [];
+  
+  const data = sheet.getRange(
+    CONFIG.START_ROW, 1,
+    lastRow - CONFIG.START_ROW + 1,
+    3
+  ).getValues();
+  
+  const players = [];
+  for (let i = 0; i < data.length; i++) {
+    const row = data[i];
+    const userId = row[0];
+    const nama = row[1];
+    const poin = row[2];
+    
+    if (userId && userId.toString().trim()) {
+      players.push({
+        user_id: Number(userId.toString().replace(/\D/g, '')) || 0,
+        first_name: (nama || '').toString().trim() || 'Player_' + userId,
+        points: Number(poin) || 0
+      });
+    }
+  }
+  
+  return players;
+}
+
+// ==================== KIRIM KE API ====================
+function sendToAPI(players) {
+  const url = `${CONFIG.API_URL}/bulk-import/${CONFIG.GAME_NAME}`;
+  
+  const options = {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'api-key': CONFIG.API_KEY
+    },
+    payload: JSON.stringify(players),
+    muteHttpExceptions: true,
+    timeout: 300000
+  };
+  
+  const response = UrlFetchApp.fetch(url, options);
+  const code = response.getResponseCode();
+  
+  if (code === 200) {
+    return JSON.parse(response.getContentText());
+  } else {
+    throw new Error(`HTTP ${code}: ${response.getContentText()}`);
+  }
+}
+
+// ==================== TEST KONEKSI ====================
+function testKoneksi() {
+  try {
+    const url = CONFIG.API_URL + '/health';
+    const response = UrlFetchApp.fetch(url);
+    const data = JSON.parse(response.getContentText());
+    
+    Logger.log('✅ KONEKSI OK');
+    Logger.log(`🌐 ${CONFIG.API_URL}`);
+    Logger.log('📊 Game:');
+    
+    if (data.games) {
+      for (const [game, count] of Object.entries(data.games)) {
+        Logger.log(`   • ${game}: ${count} pemain`);
+      }
+    }
+    
+  } catch (e) {
+    Logger.log('❌ Gagal: ' + e.toString());
+  }
+}
