@@ -7,7 +7,7 @@ from datetime import datetime
 # ==================== KONFIGURASI LANGSUNG (HARDCODED) ====================
 
 # 🔴 PERINGATAN: GANTI DENGAN DATA KAMU SEBELUM DEPLOY!
-MONGO_URI = "mongodb+srv://aknme19:aknme19@bottiktok.obn04.mongodb.net/?appName=BotTiktok"
+MONGO_URI = "mongodb+srv://galeh:galeh@cluster0.cq2tj1u.mongodb.net/?retryWrites=true&w=majority"
 DB_NAME = "quiz_bot"
 COLLECTION_NAME = "players"
 API_KEY = "kunci975635885rii7"
