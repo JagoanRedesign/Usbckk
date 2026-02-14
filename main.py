@@ -1,11 +1,13 @@
 from fastapi import FastAPI, HTTPException, Depends, Header, Query
 from pymongo import MongoClient
+from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutError
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime
+from contextlib import asynccontextmanager
+import os
 
 # ==================== KONFIGURASI LANGSUNG (HARDCODED) ====================
-
 # 🔴 PERINGATAN: GANTI DENGAN DATA KAMU SEBELUM DEPLOY!
 MONGO_URI = "mongodb+srv://galeh:galeh@cluster0.cq2tj1u.mongodb.net/?retryWrites=true&w=majority"
 DB_NAME = "quiz_bot"
@@ -15,41 +17,99 @@ PORT = 8000
 HOST = "0.0.0.0"
 
 # Untuk production di Koyeb, PORT akan diganti otomatis
-import os
 PORT = int(os.environ.get("PORT", PORT))
 
+# ==================== VARIABEL GLOBAL ====================
+client = None
+db = None
+collection = None
+
+# ==================== LIFESPAN CONTEXT MANAGER ====================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Mengelola startup dan shutdown aplikasi
+    - Startup: koneksi ke MongoDB, buat index
+    - Shutdown: tutup koneksi MongoDB
+    """
+    global client, db, collection
+    
+    print(f"🚀 Starting Quiz Bot API...")
+    print(f"📊 Database: {DB_NAME}")
+    print(f"📦 Collection: {COLLECTION_NAME}")
+    print(f"🔑 API Key: {'✅ Tersedia' if API_KEY else '❌ Tidak ada'}")
+    
+    # --- STARTUP: Koneksi MongoDB ---
+    try:
+        print("🔄 Menghubungkan ke MongoDB...")
+        client = MongoClient(
+            MONGO_URI, 
+            serverSelectionTimeoutMS=10000,  # Timeout 10 detik
+            connectTimeoutMS=10000,
+            socketTimeoutMS=30000
+        )
+        
+        # Test koneksi dengan ping
+        client.admin.command('ping')
+        print("✅ Ping MongoDB berhasil!")
+        
+        db = client[DB_NAME]
+        collection = db[COLLECTION_NAME]
+        
+        # Buat index untuk sorting poin
+        collection.create_index("points", -1)
+        collection.create_index("username")
+        collection.create_index("user_id")  # Index tambahan
+        
+        print("✅ Koneksi MongoDB berhasil!")
+        
+        # Hitung total pemain
+        total_players = collection.count_documents({})
+        print(f"📊 Total pemain saat ini: {total_players}")
+        
+        # Tampilkan top 3 jika ada
+        if total_players > 0:
+            top3 = list(collection.find().sort("points", -1).limit(3))
+            print("🏆 Top 3 Players:")
+            for i, p in enumerate(top3, 1):
+                name = p.get("username") or p.get("first_name") or f"Player {p['_id']}"
+                print(f"   {i}. {name}: {p['points']} poin")
+        
+    except ConnectionFailure as e:
+        print(f"❌ Gagal koneksi MongoDB (ConnectionFailure): {e}")
+        print("🔍 Periksa: Apakah MongoDB Atlas mengizinkan akses dari IP Koyeb?")
+        client = None
+        db = None
+        collection = None
+    except ServerSelectionTimeoutError as e:
+        print(f"❌ Gagal koneksi MongoDB (Timeout): {e}")
+        print("🔍 Periksa: Apakah URI MongoDB benar? Apakah password mengandung karakter khusus?")
+        client = None
+        db = None
+        collection = None
+    except Exception as e:
+        print(f"❌ Gagal koneksi MongoDB: {type(e).__name__}: {e}")
+        client = None
+        db = None
+        collection = None
+    
+    yield  # Aplikasi berjalan di sini
+    
+    # --- SHUTDOWN: Tutup koneksi ---
+    print("👋 API shutting down...")
+    if client:
+        client.close()
+        print("✅ Koneksi MongoDB ditutup")
+
+# ==================== INISIALISASI FASTAPI ====================
 app = FastAPI(
     title="Quiz Bot API", 
     description="API untuk manajemen poin game kuis Telegram",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan,
+    docs_url="/docs",
+    redoc_url="/redoc"
 )
-
-print(f"🚀 Starting Quiz Bot API...")
-print(f"📊 Database: {DB_NAME}")
-print(f"📦 Collection: {COLLECTION_NAME}")
-print(f"🔑 API Key: {'✅ Tersedia' if API_KEY else '❌ Tidak ada'}")
-
-# ==================== KONEKSI MONGODB ====================
-try:
-    client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
-    # Test koneksi
-    client.admin.command('ping')
-    db = client[DB_NAME]
-    collection = db[COLLECTION_NAME]
-    
-    # Buat index untuk sorting poin
-    collection.create_index("points", -1)
-    collection.create_index("username")
-    
-    print("✅ Koneksi MongoDB berhasil!")
-    print(f"📊 Total pemain saat ini: {collection.count_documents({})}")
-    
-except Exception as e:
-    print(f"❌ Gagal koneksi MongoDB: {e}")
-    # Jangan raise error di sini biar app tetap jalan, health check akan menunjukkan status
-    client = None
-    db = None
-    collection = None
 
 # ==================== FUNGSI VERIFIKASI ====================
 def verify_api_key(api_key: str = Header(...)):
@@ -63,7 +123,10 @@ def verify_api_key(api_key: str = Header(...)):
 def get_collection():
     """Helper untuk mendapatkan collection dengan error handling"""
     if collection is None:
-        raise HTTPException(status_code=503, detail="Database connection not available")
+        raise HTTPException(
+            status_code=503, 
+            detail="Database connection not available. Please check /health endpoint."
+        )
     return collection
 
 # ==================== MODEL DATA ====================
@@ -82,6 +145,8 @@ class PlayerResponse(BaseModel):
     last_name: Optional[str] = None
     username: Optional[str] = None
     rank: Optional[int] = None
+    total_games: Optional[int] = None
+    correct_answers: Optional[int] = None
 
 class HealthResponse(BaseModel):
     status: str
@@ -90,26 +155,31 @@ class HealthResponse(BaseModel):
     timestamp: str
     mongo_uri_configured: bool
     api_key_configured: bool
+    mongodb_version: Optional[str] = None
 
 # ==================== ENDPOINTS ====================
 
 @app.get("/")
 async def root():
     """Root endpoint dengan informasi API"""
+    db_status = "connected" if collection is not None else "disconnected"
+    
     return {
         "service": "Quiz Bot API",
         "version": "1.0.0",
         "status": "running",
-        "database": "connected" if collection is not None else "disconnected",
+        "database": db_status,
+        "timestamp": datetime.now().isoformat(),
         "endpoints": [
             {"method": "GET", "path": "/", "description": "Info API"},
-            {"method": "GET", "path": "/health", "description": "Health check"},
+            {"method": "GET", "path": "/health", "description": "Health check (public)"},
             {"method": "GET", "path": "/points/{user_id}", "description": "GET poin pemain"},
             {"method": "POST", "path": "/points", "description": "POST update poin"},
             {"method": "GET", "path": "/leaderboard", "description": "GET peringkat"},
             {"method": "GET", "path": "/players", "description": "GET semua pemain"},
             {"method": "DELETE", "path": "/points/{user_id}", "description": "Reset poin pemain"},
-            {"method": "GET", "path": "/stats", "description": "GET statistik umum"}
+            {"method": "GET", "path": "/stats", "description": "GET statistik umum"},
+            {"method": "GET", "path": "/top/{count}", "description": "GET N pemain teratas"}
         ]
     }
 
@@ -121,23 +191,34 @@ async def health_check():
     """
     db_status = "disconnected"
     total_players = 0
+    mongodb_version = None
     
     try:
         if client:
+            # Coba ping
             client.admin.command('ping')
             db_status = "connected"
+            
+            # Ambil versi MongoDB
+            server_info = client.server_info()
+            mongodb_version = server_info.get('version', 'unknown')
+            
             if collection:
                 total_players = collection.count_documents({})
     except Exception as e:
         print(f"Health check error: {e}")
     
+    # Tentukan status keseluruhan
+    overall_status = "healthy" if db_status == "connected" else "unhealthy"
+    
     return {
-        "status": "healthy" if db_status == "connected" else "unhealthy",
+        "status": overall_status,
         "database": db_status,
         "total_players": total_players,
         "timestamp": datetime.now().isoformat(),
         "mongo_uri_configured": bool(MONGO_URI),
-        "api_key_configured": bool(API_KEY)
+        "api_key_configured": bool(API_KEY),
+        "mongodb_version": mongodb_version
     }
 
 @app.get("/points/{user_id}", response_model=PlayerResponse)
@@ -178,7 +259,9 @@ async def get_points(
                 "first_name": None,
                 "last_name": None,
                 "username": None,
-                "rank": None
+                "rank": None,
+                "total_games": 0,
+                "correct_answers": 0
             }
         
         # Hitung peringkat
@@ -191,7 +274,9 @@ async def get_points(
             "first_name": player.get("first_name"),
             "last_name": player.get("last_name"),
             "username": player.get("username"),
-            "rank": rank
+            "rank": rank,
+            "total_games": player.get("total_games", 0),
+            "correct_answers": player.get("correct_answers", 0)
         }
         
     except Exception as e:
@@ -214,7 +299,7 @@ async def update_points(
         # Data yang akan diupdate
         update_data = {"$inc": {"points": update.points}}
         
-        # Data tambahan
+        # Data tambahan untuk $set
         set_data = {"updated_at": datetime.now()}
         
         # Update counter games hanya jika ini adalah jawaban (points != 0)
@@ -272,7 +357,9 @@ async def update_points(
             "first_name": player.get("first_name"),
             "last_name": player.get("last_name"),
             "username": player.get("username"),
-            "rank": rank
+            "rank": rank,
+            "total_games": player.get("total_games", 0),
+            "correct_answers": player.get("correct_answers", 0)
         }
         
     except Exception as e:
@@ -302,7 +389,9 @@ async def get_leaderboard(
                 "first_name": doc.get("first_name"),
                 "last_name": doc.get("last_name"),
                 "username": doc.get("username"),
-                "rank": rank
+                "rank": rank,
+                "total_games": doc.get("total_games", 0),
+                "correct_answers": doc.get("correct_answers", 0)
             }
             leaderboard.append(player)
         
@@ -370,6 +459,12 @@ async def reset_points(
     coll = get_collection()
     
     try:
+        # Cek apakah pemain ada
+        player = coll.find_one({"_id": user_id})
+        if not player:
+            raise HTTPException(status_code=404, detail="Player not found")
+        
+        # Reset poin
         result = coll.update_one(
             {"_id": user_id},
             {
@@ -380,15 +475,14 @@ async def reset_points(
             }
         )
         
-        if result.matched_count == 0:
-            raise HTTPException(status_code=404, detail="Player not found")
-        
         print(f"🔄 Poin pemain {user_id} telah direset")
         return {
             "message": f"Poin pemain {user_id} telah direset ke 0",
             "success": True
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"❌ Error reset_points: {e}")
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
@@ -409,16 +503,20 @@ async def get_stats(api_key: str = Depends(verify_api_key)):
     try:
         total_players = coll.count_documents({})
         
-        # Hitung total points
+        # Hitung total points menggunakan aggregation
         pipeline = [
             {"$group": {
                 "_id": None,
                 "total_points": {"$sum": "$points"},
                 "avg_points": {"$avg": "$points"},
-                "max_points": {"$max": "$points"}
+                "max_points": {"$max": "$points"},
+                "min_points": {"$min": "$points"},
+                "total_games": {"$sum": "$total_games"},
+                "total_correct": {"$sum": "$correct_answers"}
             }}
         ]
-        stats = list(coll.aggregate(pipeline))
+        stats_result = list(coll.aggregate(pipeline))
+        stats = stats_result[0] if stats_result else {}
         
         # Top player
         top_player = coll.find_one(sort=[("points", -1)])
@@ -426,11 +524,18 @@ async def get_stats(api_key: str = Depends(verify_api_key)):
         # Player dengan game terbanyak
         most_active = coll.find_one(sort=[("total_games", -1)])
         
+        # Hitung pemain dengan poin > 0
+        active_players = coll.count_documents({"points": {"$gt": 0}})
+        
         return {
             "total_players": total_players,
-            "total_points": stats[0]["total_points"] if stats else 0,
-            "average_points": round(stats[0]["avg_points"], 2) if stats else 0,
-            "max_points": stats[0]["max_points"] if stats else 0,
+            "active_players": active_players,
+            "total_points": stats.get("total_points", 0),
+            "average_points": round(stats.get("avg_points", 0), 2),
+            "max_points": stats.get("max_points", 0),
+            "min_points": stats.get("min_points", 0),
+            "total_games_played": stats.get("total_games", 0),
+            "total_correct_answers": stats.get("total_correct", 0),
             "top_player": {
                 "user_id": top_player["_id"] if top_player else None,
                 "points": top_player["points"] if top_player else 0,
@@ -449,17 +554,19 @@ async def get_stats(api_key: str = Depends(verify_api_key)):
         print(f"❌ Error stats: {e}")
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
-# ==================== ENDPOINT TAMBAHAN ====================
-
 @app.get("/top/{count}")
 async def get_top_players(
-    count: int = 5,
+    count: int,
     api_key: str = Depends(verify_api_key)
 ):
     """Mendapatkan N pemain teratas"""
     coll = get_collection()
     
     try:
+        # Validasi input
+        if count < 1 or count > 100:
+            count = 10
+        
         cursor = coll.find().sort("points", -1).limit(count)
         
         top_players = []
@@ -469,7 +576,8 @@ async def get_top_players(
                 "user_id": doc["_id"],
                 "points": doc["points"],
                 "name": doc.get("first_name") or doc.get("username") or f"Player {doc['_id']}",
-                "username": doc.get("username")
+                "username": doc.get("username"),
+                "total_games": doc.get("total_games", 0)
             })
         
         return {
@@ -486,42 +594,78 @@ async def get_player_history(
     user_id: int,
     api_key: str = Depends(verify_api_key)
 ):
-    """Mendapatkan history permainan pemain (jika ada collection terpisah)"""
-    # Ini hanya contoh, Anda perlu collection terpisah untuk history
-    return {
-        "user_id": user_id,
-        "message": "Fitur history belum diimplementasikan. Buat collection 'game_history' untuk menyimpan history."
-    }
-
-# ==================== EVENT HANDLER ====================
-@app.on_event("startup")
-async def startup_event():
-    """Jalankan saat aplikasi start"""
-    print("🚀 API starting up...")
-    if collection is not None:
-        total = collection.count_documents({})
-        print(f"📊 Total players in database: {total}")
+    """
+    Mendapatkan history permainan pemain
+    Catatan: Fitur ini membutuhkan collection terpisah 'game_history'
+    """
+    try:
+        # Cek apakah collection history ada
+        if "game_history" not in db.list_collection_names():
+            return {
+                "user_id": user_id,
+                "message": "Fitur history belum diimplementasikan. Buat collection 'game_history' untuk menyimpan history.",
+                "history": []
+            }
         
-        # Tampilkan top 3
-        top3 = list(collection.find().sort("points", -1).limit(3))
-        if top3:
-            print("🏆 Top 3 Players:")
-            for i, p in enumerate(top3, 1):
-                name = p.get("username") or p.get("first_name") or f"Player {p['_id']}"
-                print(f"   {i}. {name}: {p['points']} poin")
+        history_coll = db["game_history"]
+        history = list(history_coll.find({"user_id": user_id}).sort("played_at", -1).limit(20))
+        
+        # Convert ObjectId to string
+        for h in history:
+            h["_id"] = str(h["_id"])
+        
+        return {
+            "user_id": user_id,
+            "total_games": len(history),
+            "history": history
+        }
+        
+    except Exception as e:
+        print(f"❌ Error get_player_history: {e}")
+        return {
+            "user_id": user_id,
+            "error": str(e),
+            "message": "Gagal mengambil history"
+        }
 
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Jalankan saat aplikasi shutdown"""
-    print("👋 API shutting down...")
+@app.post("/debug/check-connection")
+async def debug_connection(api_key: str = Depends(verify_api_key)):
+    """Endpoint debug untuk memeriksa koneksi MongoDB"""
+    result = {
+        "client_exists": client is not None,
+        "db_exists": db is not None,
+        "collection_exists": collection is not None,
+        "mongodb_uri": MONGO_URI[:30] + "..." if MONGO_URI else None,
+        "database_name": DB_NAME,
+        "collection_name": COLLECTION_NAME
+    }
+    
     if client:
-        client.close()
+        try:
+            # Coba list database
+            databases = client.list_database_names()
+            result["databases"] = databases
+            result["current_db_exists"] = DB_NAME in databases
+            
+            if db:
+                collections = db.list_collection_names()
+                result["collections"] = collections
+                result["current_collection_exists"] = COLLECTION_NAME in collections
+                
+                if collection:
+                    count = collection.count_documents({})
+                    result["document_count"] = count
+                    
+        except Exception as e:
+            result["error"] = str(e)
+    
+    return result
 
 # ==================== RUNNER ====================
 if __name__ == "__main__":
     import uvicorn
-    print(f"🌐 Server running on http://{HOST}:{PORT}")
-    print(f"📚 Documentation: http://{HOST}:{PORT}/docs")
+    print(f"🌐 Server akan berjalan di http://{HOST}:{PORT}")
+    print(f"📚 Dokumentasi: http://{HOST}:{PORT}/docs")
     print(f"🔍 Health check: http://{HOST}:{PORT}/health")
     uvicorn.run(
         "main:app",
