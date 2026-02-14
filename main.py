@@ -2,29 +2,27 @@ from fastapi import FastAPI, HTTPException, Depends, Header, Query
 from pymongo import MongoClient
 from pydantic import BaseModel
 from typing import Optional, List
-import os
 from datetime import datetime
+
+# ==================== KONFIGURASI LANGSUNG (HARDCODED) ====================
+
+# 🔴 PERINGATAN: GANTI DENGAN DATA KAMU SEBELUM DEPLOY!
+MONGO_URI = "mongodb+srv://aknme19:aknme19@bottiktok.obn04.mongodb.net/?appName=BotTiktok"
+DB_NAME = "quiz_bot"
+COLLECTION_NAME = "players"
+API_KEY = "kunci975635885rii7"
+PORT = 8000
+HOST = "0.0.0.0"
+
+# Untuk production di Koyeb, PORT akan diganti otomatis
+import os
+PORT = int(os.environ.get("PORT", PORT))
 
 app = FastAPI(
     title="Quiz Bot API", 
     description="API untuk manajemen poin game kuis Telegram",
     version="1.0.0"
 )
-
-# ==================== KONFIGURASI ====================
-# Ambil dari environment variable Koyeb
-MONGO_URI = os.getenv("MONGO_URI")
-if not MONGO_URI:
-    raise ValueError("❌ MONGO_URI tidak ditemukan di environment variable!")
-
-DB_NAME = os.getenv("DB_NAME", "quiz_bot")
-COLLECTION_NAME = os.getenv("COLLECTION_NAME", "players")
-API_KEY = os.getenv("API_KEY")
-if not API_KEY:
-    raise ValueError("❌ API_KEY tidak ditemukan di environment variable!")
-
-PORT = int(os.getenv("PORT", 8000))
-HOST = os.getenv("HOST", "0.0.0.0")
 
 print(f"🚀 Starting Quiz Bot API...")
 print(f"📊 Database: {DB_NAME}")
@@ -85,10 +83,6 @@ class PlayerResponse(BaseModel):
     username: Optional[str] = None
     rank: Optional[int] = None
 
-class LeaderboardResponse(BaseModel):
-    leaderboard: List[PlayerResponse]
-    total_players: int
-
 class HealthResponse(BaseModel):
     status: str
     database: str
@@ -114,7 +108,8 @@ async def root():
             {"method": "POST", "path": "/points", "description": "POST update poin"},
             {"method": "GET", "path": "/leaderboard", "description": "GET peringkat"},
             {"method": "GET", "path": "/players", "description": "GET semua pemain"},
-            {"method": "DELETE", "path": "/points/{user_id}", "description": "Reset poin pemain"}
+            {"method": "DELETE", "path": "/points/{user_id}", "description": "Reset poin pemain"},
+            {"method": "GET", "path": "/stats", "description": "GET statistik umum"}
         ]
     }
 
@@ -186,7 +181,7 @@ async def get_points(
                 "rank": None
             }
         
-        # Hitung peringkat (opsional)
+        # Hitung peringkat
         rank = coll.count_documents({"points": {"$gt": player["points"]}}) + 1
         
         print(f"📊 Poin pemain {user_id}: {player['points']} (Rank: {rank})")
@@ -219,15 +214,20 @@ async def update_points(
         # Data yang akan diupdate
         update_data = {"$inc": {"points": update.points}}
         
-        # Data tambahan (jika ada)
-        set_data = {
-            "updated_at": datetime.now(),
-            "$inc": {"total_games": 1}  # Tambah counter game
-        }
+        # Data tambahan
+        set_data = {"updated_at": datetime.now()}
         
-        if update.points > 0:
-            set_data["$inc"]["correct_answers"] = 1
+        # Update counter games hanya jika ini adalah jawaban (points != 0)
+        inc_data = {}
+        if update.points != 0:
+            inc_data["total_games"] = 1
+            if update.points > 0:
+                inc_data["correct_answers"] = 1
         
+        if inc_data:
+            update_data["$inc"].update(inc_data)
+        
+        # Update profil jika ada
         if update.first_name:
             set_data["first_name"] = update.first_name
         if update.last_name:
@@ -408,20 +408,40 @@ async def get_stats(api_key: str = Depends(verify_api_key)):
     
     try:
         total_players = coll.count_documents({})
-        total_points = sum(p.get("points", 0) for p in coll.find({}, {"points": 1}))
+        
+        # Hitung total points
+        pipeline = [
+            {"$group": {
+                "_id": None,
+                "total_points": {"$sum": "$points"},
+                "avg_points": {"$avg": "$points"},
+                "max_points": {"$max": "$points"}
+            }}
+        ]
+        stats = list(coll.aggregate(pipeline))
         
         # Top player
         top_player = coll.find_one(sort=[("points", -1)])
         
+        # Player dengan game terbanyak
+        most_active = coll.find_one(sort=[("total_games", -1)])
+        
         return {
             "total_players": total_players,
-            "total_points": total_points,
-            "average_points": round(total_points / total_players, 2) if total_players > 0 else 0,
+            "total_points": stats[0]["total_points"] if stats else 0,
+            "average_points": round(stats[0]["avg_points"], 2) if stats else 0,
+            "max_points": stats[0]["max_points"] if stats else 0,
             "top_player": {
                 "user_id": top_player["_id"] if top_player else None,
                 "points": top_player["points"] if top_player else 0,
-                "username": top_player.get("username") if top_player else None
+                "username": top_player.get("username") if top_player else None,
+                "first_name": top_player.get("first_name") if top_player else None
             } if top_player else None,
+            "most_active_player": {
+                "user_id": most_active["_id"] if most_active else None,
+                "total_games": most_active.get("total_games", 0) if most_active else 0,
+                "username": most_active.get("username") if most_active else None
+            } if most_active else None,
             "timestamp": datetime.now().isoformat()
         }
         
@@ -429,13 +449,66 @@ async def get_stats(api_key: str = Depends(verify_api_key)):
         print(f"❌ Error stats: {e}")
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
+# ==================== ENDPOINT TAMBAHAN ====================
+
+@app.get("/top/{count}")
+async def get_top_players(
+    count: int = 5,
+    api_key: str = Depends(verify_api_key)
+):
+    """Mendapatkan N pemain teratas"""
+    coll = get_collection()
+    
+    try:
+        cursor = coll.find().sort("points", -1).limit(count)
+        
+        top_players = []
+        for doc in cursor:
+            top_players.append({
+                "rank": len(top_players) + 1,
+                "user_id": doc["_id"],
+                "points": doc["points"],
+                "name": doc.get("first_name") or doc.get("username") or f"Player {doc['_id']}",
+                "username": doc.get("username")
+            })
+        
+        return {
+            "count": len(top_players),
+            "top_players": top_players
+        }
+        
+    except Exception as e:
+        print(f"❌ Error get_top_players: {e}")
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+@app.get("/player/{user_id}/history")
+async def get_player_history(
+    user_id: int,
+    api_key: str = Depends(verify_api_key)
+):
+    """Mendapatkan history permainan pemain (jika ada collection terpisah)"""
+    # Ini hanya contoh, Anda perlu collection terpisah untuk history
+    return {
+        "user_id": user_id,
+        "message": "Fitur history belum diimplementasikan. Buat collection 'game_history' untuk menyimpan history."
+    }
+
 # ==================== EVENT HANDLER ====================
 @app.on_event("startup")
 async def startup_event():
     """Jalankan saat aplikasi start"""
     print("🚀 API starting up...")
     if collection is not None:
-        print(f"📊 Total players in database: {collection.count_documents({})}")
+        total = collection.count_documents({})
+        print(f"📊 Total players in database: {total}")
+        
+        # Tampilkan top 3
+        top3 = list(collection.find().sort("points", -1).limit(3))
+        if top3:
+            print("🏆 Top 3 Players:")
+            for i, p in enumerate(top3, 1):
+                name = p.get("username") or p.get("first_name") or f"Player {p['_id']}"
+                print(f"   {i}. {name}: {p['points']} poin")
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -449,6 +522,7 @@ if __name__ == "__main__":
     import uvicorn
     print(f"🌐 Server running on http://{HOST}:{PORT}")
     print(f"📚 Documentation: http://{HOST}:{PORT}/docs")
+    print(f"🔍 Health check: http://{HOST}:{PORT}/health")
     uvicorn.run(
         "main:app",
         host=HOST,
