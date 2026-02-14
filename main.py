@@ -1,16 +1,15 @@
 from fastapi import FastAPI, HTTPException, Depends, Header, Query
 from pymongo import MongoClient
-from pymongo.server_api import ServerApi  # <-- PENTING: Import ServerApi
-from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutError
+from pymongo.server_api import ServerApi
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime
 from contextlib import asynccontextmanager
 import os
 import sys
+import traceback
 
-# ==================== KONFIGURASI LANGSUNG (HARDCODED) ====================
-# 🔴 PERINGATAN: GANTI DENGAN DATA KAMU SEBELUM DEPLOY!
+# ==================== KONFIGURASI LANGSUNG ====================
 MONGO_URI = "mongodb+srv://galeh:galeh@cluster0.cq2tj1u.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
 DB_NAME = "quiz_bot"
 COLLECTION_NAME = "players"
@@ -18,7 +17,6 @@ API_KEY = "kunci975635885rii7"
 PORT = 8000
 HOST = "0.0.0.0"
 
-# Untuk production di Koyeb, PORT akan diganti otomatis
 PORT = int(os.environ.get("PORT", PORT))
 
 # ==================== VARIABEL GLOBAL ====================
@@ -29,82 +27,62 @@ collection = None
 print(f"🐍 Python version: {sys.version}")
 print(f"🔌 MongoDB URI: {MONGO_URI[:50]}...")
 
-# ==================== LIFESPAN CONTEXT MANAGER ====================
+# ==================== LIFESPAN ====================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    Mengelola startup dan shutdown aplikasi
-    """
     global client, db, collection
-    
     print(f"🚀 Starting Quiz Bot API...")
     print(f"📊 Database: {DB_NAME}")
     print(f"📦 Collection: {COLLECTION_NAME}")
     print(f"🔑 API Key: {'✅ Tersedia' if API_KEY else '❌ Tidak ada'}")
-    
-    # --- STARTUP: Koneksi MongoDB ---
+
     try:
         print("🔄 Menghubungkan ke MongoDB dengan ServerApi('1')...")
-        
-        # Gunakan ServerApi('1') untuk kompatibilitas
         client = MongoClient(
             MONGO_URI,
-            server_api=ServerApi('1'),  # <-- INI KUNCI UTAMA!
+            server_api=ServerApi('1'),
             connectTimeoutMS=30000,
             socketTimeoutMS=30000,
             serverSelectionTimeoutMS=30000
         )
-        
-        # Test koneksi dengan ping
         client.admin.command('ping')
         print("✅ Ping MongoDB berhasil!")
-        
+
         db = client[DB_NAME]
         collection = db[COLLECTION_NAME]
-        
-        # Buat index
-        try:
-            collection.create_index("points", -1)
-            collection.create_index("username")
-            print("✅ Index berhasil dibuat")
-        except Exception as idx_err:
-            print(f"⚠️ Warning saat buat index: {idx_err}")
-        
-        # Hitung total pemain
+
+        collection.create_index("points", -1)
+        collection.create_index("username")
+        print("✅ Index berhasil dibuat")
+
         total_players = collection.count_documents({})
         print(f"📊 Total pemain saat ini: {total_players}")
-        
-        # Tampilkan top 3
+
         if total_players > 0:
             top3 = list(collection.find().sort("points", -1).limit(3))
             print("🏆 Top 3 Players:")
             for i, p in enumerate(top3, 1):
                 name = p.get("username") or p.get("first_name") or f"Player {p['_id']}"
                 print(f"   {i}. {name}: {p['points']} poin")
-        
-        print("✅ Koneksi MongoDB BERHASIL dengan ServerApi('1')!")
-        
+
+        print("✅ Koneksi MongoDB BERHASIL!")
     except Exception as e:
         print(f"❌ Gagal koneksi MongoDB: {type(e).__name__}: {e}")
-        print("🔍 Detail error:")
-        import traceback
         traceback.print_exc()
-        
         client = None
         db = None
         collection = None
-    
-    yield  # Aplikasi berjalan di sini
-    
-    # --- SHUTDOWN: Tutup koneksi ---
+
+    yield
+
     print("👋 API shutting down...")
     if client:
         client.close()
         print("✅ Koneksi MongoDB ditutup")
 
-# ==================== INISIALISASI FASTAPI ====================
+# ==================== INISIALISASI APP ====================
 app = FastAPI(
-    title="Quiz Bot API", 
+    title="Quiz Bot API",
     description="API untuk manajemen poin game kuis Telegram",
     version="1.0.0",
     lifespan=lifespan
@@ -112,7 +90,6 @@ app = FastAPI(
 
 # ==================== FUNGSI VERIFIKASI ====================
 def verify_api_key(api_key: str = Header(...)):
-    """Verifikasi API Key dari header request"""
     if not API_KEY:
         raise HTTPException(status_code=500, detail="Server configuration error: API_KEY not set")
     if api_key != API_KEY:
@@ -120,18 +97,14 @@ def verify_api_key(api_key: str = Header(...)):
     return api_key
 
 def get_collection():
-    """Helper untuk mendapatkan collection dengan error handling"""
     if collection is None:
-        raise HTTPException(
-            status_code=503, 
-            detail="Database connection not available. Please check /health endpoint."
-        )
+        raise HTTPException(status_code=503, detail="Database connection not available")
     return collection
 
 # ==================== MODEL DATA ====================
 class PointUpdate(BaseModel):
     user_id: int
-    points: int  # bisa positif (tambah) atau negatif (kurang)
+    points: int
     first_name: Optional[str] = None
     last_name: Optional[str] = None
     username: Optional[str] = None
@@ -161,9 +134,7 @@ class HealthResponse(BaseModel):
 
 @app.get("/")
 async def root():
-    """Root endpoint dengan informasi API"""
     db_status = "connected" if collection is not None else "disconnected"
-    
     return {
         "service": "Quiz Bot API",
         "version": "1.0.0",
@@ -187,24 +158,19 @@ async def root():
 
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
-    """
-    Cek status API dan koneksi MongoDB
-    Endpoint ini TIDAK memerlukan API Key untuk monitoring
-    """
     db_status = "disconnected"
     total_players = 0
     error_detail = None
-    
+
     try:
         if client:
-            # Test ping
             try:
                 client.admin.command('ping')
                 db_status = "connected"
             except Exception as e:
                 error_detail = str(e)
                 db_status = "error"
-            
+
             if collection and db_status == "connected":
                 try:
                     total_players = collection.count_documents({})
@@ -214,10 +180,8 @@ async def health_check():
     except Exception as e:
         print(f"Health check error: {e}")
         error_detail = str(e)
-    
-    # Tentukan status keseluruhan
+
     overall_status = "healthy" if db_status == "connected" else "unhealthy"
-    
     return {
         "status": overall_status,
         "database": db_status,
@@ -231,7 +195,6 @@ async def health_check():
 
 @app.get("/debug/connection")
 async def debug_connection(api_key: str = Depends(verify_api_key)):
-    """Endpoint debug untuk memeriksa koneksi MongoDB"""
     debug_info = {
         "python_version": sys.version,
         "server_api": "1",
@@ -241,51 +204,27 @@ async def debug_connection(api_key: str = Depends(verify_api_key)):
         "mongodb_uri": MONGO_URI[:50] + "..." if MONGO_URI else None,
         "database_name": DB_NAME,
         "collection_name": COLLECTION_NAME,
-        "environment_variables": {
-            "PORT": os.environ.get("PORT", "not set"),
-            "PYTHON_VERSION": os.environ.get("PYTHON_VERSION", "not set")
-        }
     }
-    
     if client:
         try:
-            # Test ping
             ping_result = client.admin.command('ping')
             debug_info["ping_result"] = ping_result
-            
-            # Coba list database
             debug_info["databases"] = client.list_database_names()
-            
             if db:
                 debug_info["collections"] = db.list_collection_names()
-                
                 if collection:
                     debug_info["document_count"] = collection.count_documents({})
-                    
         except Exception as e:
             debug_info["error"] = str(e)
-            import traceback
             debug_info["traceback"] = traceback.format_exc()
-    
     return debug_info
 
 @app.get("/points/{user_id}", response_model=PlayerResponse)
-async def get_points(
-    user_id: int, 
-    api_key: str = Depends(verify_api_key)
-):
-    """
-    Mendapatkan poin pemain berdasarkan user_id
-    - Jika pemain tidak ada: dibuat dengan poin 0
-    - Jika pemain ada: return poin saat ini
-    """
+async def get_points(user_id: int, api_key: str = Depends(verify_api_key)):
     coll = get_collection()
-    
     try:
         player = coll.find_one({"_id": user_id})
-        
         if not player:
-            # Pemain tidak ada - buat baru dengan poin 0
             new_player = {
                 "_id": user_id,
                 "points": 0,
@@ -300,7 +239,6 @@ async def get_points(
             }
             coll.insert_one(new_player)
             print(f"✅ Pemain baru dibuat: {user_id}")
-            
             return {
                 "user_id": user_id,
                 "points": 0,
@@ -311,10 +249,8 @@ async def get_points(
                 "total_games": 0,
                 "correct_answers": 0
             }
-        
-        # Hitung peringkat
+
         rank = coll.count_documents({"points": {"$gt": player["points"]}}) + 1
-        
         print(f"📊 Poin pemain {user_id}: {player['points']} (Rank: {rank})")
         return {
             "user_id": player["_id"],
@@ -326,79 +262,56 @@ async def get_points(
             "total_games": player.get("total_games", 0),
             "correct_answers": player.get("correct_answers", 0)
         }
-        
     except Exception as e:
         print(f"❌ Error get_points: {e}")
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 @app.post("/points", response_model=PlayerResponse)
-async def update_points(
-    update: PointUpdate, 
-    api_key: str = Depends(verify_api_key)
-):
-    """
-    Update poin pemain
-    - Jika pemain tidak ada: dibuat dengan poin yang diberikan
-    - Jika pemain ada: poin ditambah/dikurang
-    """
+async def update_points(update: PointUpdate, api_key: str = Depends(verify_api_key)):
     coll = get_collection()
-    
     try:
-        # Data yang akan diupdate
-        update_data = {"$inc": {"points": update.points}}
-        
-        # Data tambahan untuk $set
-        set_data = {"updated_at": datetime.now()}
-        
-        # Update counter games hanya jika ini adalah jawaban (points != 0)
-        inc_data = {}
+        # Siapkan operator update
+        update_ops = {}
+
+        # $inc untuk poin dan statistik
+        inc_fields = {}
         if update.points != 0:
-            inc_data["total_games"] = 1
+            inc_fields["points"] = update.points
+            inc_fields["total_games"] = 1
             if update.points > 0:
-                inc_data["correct_answers"] = 1
-        
-        if inc_data:
-            update_data["$inc"].update(inc_data)
-        
-        # Update profil jika ada
+                inc_fields["correct_answers"] = 1
+        if inc_fields:
+            update_ops["$inc"] = inc_fields
+
+        # $set untuk profil dan timestamp
+        set_fields = {"updated_at": datetime.now()}
         if update.first_name:
-            set_data["first_name"] = update.first_name
+            set_fields["first_name"] = update.first_name
         if update.last_name:
-            set_data["last_name"] = update.last_name
+            set_fields["last_name"] = update.last_name
         if update.username:
-            set_data["username"] = update.username
+            set_fields["username"] = update.username
         if update.language_code:
-            set_data["language_code"] = update.language_code
-        
-        # Gabungkan update_data dengan set_data
-        if "$set" in update_data:
-            update_data["$set"].update(set_data)
-        else:
-            update_data["$set"] = set_data
-        
-        # Set created_at jika dokumen baru
-        update_data["$setOnInsert"] = {
-            "created_at": datetime.now(),
-            "total_games": 0,
-            "correct_answers": 0
-        }
-        
-        # Update atau insert
+            set_fields["language_code"] = update.language_code
+        if set_fields:
+            update_ops["$set"] = set_fields
+
+        # $setOnInsert untuk created_at
+        update_ops["$setOnInsert"] = {"created_at": datetime.now()}
+
+        # Eksekusi
         result = coll.update_one(
             {"_id": update.user_id},
-            update_data,
+            update_ops,
             upsert=True
         )
-        
-        # Ambil data terbaru
+
         player = coll.find_one({"_id": update.user_id})
-        
-        # Hitung peringkat
         rank = coll.count_documents({"points": {"$gt": player["points"]}}) + 1
-        
+
         action = "ditambahkan" if result.upserted_id else "diupdate"
         print(f"✅ Poin {action} untuk {update.user_id}: {update.points} (total: {player['points']})")
-        
         return {
             "user_id": player["_id"],
             "points": player["points"],
@@ -409,9 +322,9 @@ async def update_points(
             "total_games": player.get("total_games", 0),
             "correct_answers": player.get("correct_answers", 0)
         }
-        
     except Exception as e:
         print(f"❌ Error update_points: {e}")
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 @app.get("/leaderboard", response_model=List[PlayerResponse])
@@ -419,19 +332,12 @@ async def get_leaderboard(
     limit: int = Query(10, ge=1, le=50),
     api_key: str = Depends(verify_api_key)
 ):
-    """
-    Mendapatkan leaderboard
-    - Default: 10 besar
-    - Bisa diubah dengan parameter limit (max 50)
-    """
     coll = get_collection()
-    
     try:
         cursor = coll.find().sort("points", -1).limit(limit)
-        
         leaderboard = []
         for rank, doc in enumerate(cursor, start=1):
-            player = {
+            leaderboard.append({
                 "user_id": doc["_id"],
                 "points": doc["points"],
                 "first_name": doc.get("first_name"),
@@ -440,28 +346,23 @@ async def get_leaderboard(
                 "rank": rank,
                 "total_games": doc.get("total_games", 0),
                 "correct_answers": doc.get("correct_answers", 0)
-            }
-            leaderboard.append(player)
-        
+            })
         print(f"📊 Leaderboard diambil: {len(leaderboard)} pemain")
         return leaderboard
-        
     except Exception as e:
         print(f"❌ Error leaderboard: {e}")
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 @app.get("/players")
 async def get_all_players(
     skip: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=100),
-    search: Optional[str] = Query(None, description="Cari berdasarkan username atau first_name"),
+    search: Optional[str] = Query(None),
     api_key: str = Depends(verify_api_key)
 ):
-    """Mendapatkan semua pemain dengan pagination dan pencarian"""
     coll = get_collection()
-    
     try:
-        # Filter pencarian
         filter_query = {}
         if search:
             filter_query = {
@@ -470,10 +371,8 @@ async def get_all_players(
                     {"first_name": {"$regex": search, "$options": "i"}}
                 ]
             }
-        
         total = coll.count_documents(filter_query)
         cursor = coll.find(filter_query).sort("points", -1).skip(skip).limit(limit)
-        
         players = []
         for doc in cursor:
             players.append({
@@ -485,73 +384,41 @@ async def get_all_players(
                 "total_games": doc.get("total_games", 0),
                 "correct_answers": doc.get("correct_answers", 0)
             })
-        
-        return {
-            "total": total,
-            "skip": skip,
-            "limit": limit,
-            "search": search,
-            "players": players
-        }
-        
+        return {"total": total, "skip": skip, "limit": limit, "search": search, "players": players}
     except Exception as e:
         print(f"❌ Error get_all_players: {e}")
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 @app.delete("/points/{user_id}")
-async def reset_points(
-    user_id: int, 
-    api_key: str = Depends(verify_api_key)
-):
-    """Reset poin pemain ke 0 (admin only)"""
+async def reset_points(user_id: int, api_key: str = Depends(verify_api_key)):
     coll = get_collection()
-    
     try:
-        # Cek apakah pemain ada
         player = coll.find_one({"_id": user_id})
         if not player:
             raise HTTPException(status_code=404, detail="Player not found")
-        
-        # Reset poin
-        result = coll.update_one(
+        coll.update_one(
             {"_id": user_id},
-            {
-                "$set": {
-                    "points": 0, 
-                    "updated_at": datetime.now()
-                }
-            }
+            {"$set": {"points": 0, "updated_at": datetime.now()}}
         )
-        
         print(f"🔄 Poin pemain {user_id} telah direset")
-        return {
-            "message": f"Poin pemain {user_id} telah direset ke 0",
-            "success": True
-        }
-        
+        return {"message": f"Poin pemain {user_id} telah direset ke 0", "success": True}
     except HTTPException:
         raise
     except Exception as e:
         print(f"❌ Error reset_points: {e}")
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 @app.post("/points/{user_id}/reset")
-async def reset_points_post(
-    user_id: int,
-    api_key: str = Depends(verify_api_key)
-):
-    """Alternatif reset dengan method POST (untuk kompatibilitas)"""
+async def reset_points_post(user_id: int, api_key: str = Depends(verify_api_key)):
     return await reset_points(user_id, api_key)
 
 @app.get("/stats")
 async def get_stats(api_key: str = Depends(verify_api_key)):
-    """Mendapatkan statistik umum"""
     coll = get_collection()
-    
     try:
         total_players = coll.count_documents({})
-        
-        # Hitung total points menggunakan aggregation
         pipeline = [
             {"$group": {
                 "_id": None,
@@ -565,16 +432,9 @@ async def get_stats(api_key: str = Depends(verify_api_key)):
         ]
         stats_result = list(coll.aggregate(pipeline))
         stats = stats_result[0] if stats_result else {}
-        
-        # Top player
         top_player = coll.find_one(sort=[("points", -1)])
-        
-        # Player dengan game terbanyak
         most_active = coll.find_one(sort=[("total_games", -1)])
-        
-        # Hitung pemain dengan poin > 0
         active_players = coll.count_documents({"points": {"$gt": 0}})
-        
         return {
             "total_players": total_players,
             "active_players": active_players,
@@ -597,26 +457,18 @@ async def get_stats(api_key: str = Depends(verify_api_key)):
             } if most_active else None,
             "timestamp": datetime.now().isoformat()
         }
-        
     except Exception as e:
         print(f"❌ Error stats: {e}")
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 @app.get("/top/{count}")
-async def get_top_players(
-    count: int,
-    api_key: str = Depends(verify_api_key)
-):
-    """Mendapatkan N pemain teratas"""
+async def get_top_players(count: int, api_key: str = Depends(verify_api_key)):
     coll = get_collection()
-    
     try:
-        # Validasi input
         if count < 1 or count > 100:
             count = 10
-        
         cursor = coll.find().sort("points", -1).limit(count)
-        
         top_players = []
         for doc in cursor:
             top_players.append({
@@ -627,25 +479,14 @@ async def get_top_players(
                 "username": doc.get("username"),
                 "total_games": doc.get("total_games", 0)
             })
-        
-        return {
-            "count": len(top_players),
-            "top_players": top_players
-        }
-        
+        return {"count": len(top_players), "top_players": top_players}
     except Exception as e:
         print(f"❌ Error get_top_players: {e}")
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
-# ==================== RUNNER ====================
 if __name__ == "__main__":
     import uvicorn
     print(f"🌐 Server akan berjalan di http://{HOST}:{PORT}")
     print(f"📚 Dokumentasi: http://{HOST}:{PORT}/docs")
-    print(f"🔍 Health check: http://{HOST}:{PORT}/health")
-    uvicorn.run(
-        "main:app",
-        host=HOST,
-        port=PORT,
-        reload=False
-    )
+    uvicorn.run("main:app", host=HOST, port=PORT, reload=False)
