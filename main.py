@@ -550,15 +550,6 @@ async def bulk_import(
 ):
     """
     Import banyak pemain sekaligus
-    Request body: array of players
-    Format: [{"user_id": 123, "points": 100, "first_name": "Budi"}, ...]
-    
-    Contoh:
-    POST /bulk-import/susunkata
-    [
-        {"user_id": 123456789, "points": 1500, "first_name": "Budi Santoso"},
-        {"user_id": 987654321, "points": 2300, "first_name": "Siti Aminah"}
-    ]
     """
     try:
         # Validasi input
@@ -573,8 +564,6 @@ async def bulk_import(
         
         # Siapkan bulk operations
         operations = []
-        success_count = 0
-        error_count = 0
         errors = []
         
         for idx, player in enumerate(players):
@@ -582,7 +571,6 @@ async def bulk_import(
                 # Validasi required fields
                 if 'user_id' not in player:
                     errors.append(f"Row {idx}: Missing user_id")
-                    error_count += 1
                     continue
                 
                 user_id = player['user_id']
@@ -591,7 +579,6 @@ async def bulk_import(
                         user_id = int(user_id)
                     except:
                         errors.append(f"Row {idx}: Invalid user_id format (must be integer)")
-                        error_count += 1
                         continue
                 
                 # Ambil data dengan default values
@@ -603,9 +590,6 @@ async def bulk_import(
                         points = 0
                 
                 first_name = player.get('first_name', '')
-                if first_name:
-                    first_name = str(first_name)[:100]  # Batasi panjang
-                
                 last_name = player.get('last_name', '')
                 username = player.get('username', '')
                 language_code = player.get('language_code', 'id')
@@ -633,65 +617,62 @@ async def bulk_import(
                         upsert=True
                     )
                 )
-                success_count += 1
                 
             except Exception as e:
                 errors.append(f"Row {idx}: {str(e)}")
-                error_count += 1
         
-        # Eksekusi bulk write jika ada operations
+        # Eksekusi bulk write
+        total_modified = 0
+        total_upserted = 0
+        successful_ops = 0
+        
         if operations:
-            # Bagi menjadi batch 1000 untuk menghindari memory issues
-            batch_size = 1000
-            total_modified = 0
-            total_upserted = 0
-            
-            for i in range(0, len(operations), batch_size):
-                batch = operations[i:i+batch_size]
-                try:
-                    result = coll.bulk_write(batch, ordered=False)
-                    total_modified += result.modified_count
-                    total_upserted += len(result.upserted_ids)
-                except Exception as batch_error:
-                    print(f"⚠️ Batch error: {batch_error}")
-                    # Coba satu per satu untuk batch yang gagal
-                    for op in batch:
-                        try:
-                            single_result = coll.update_one(
-                                op._filter,
-                                op._doc,
-                                upsert=op._upsert
-                            )
+            # Eksekusi semua operations sekaligus
+            try:
+                result = coll.bulk_write(operations, ordered=False)
+                total_modified = result.modified_count
+                total_upserted = len(result.upserted_ids)
+                successful_ops = len(operations)
+                
+                print(f"✅ Bulk write sukses: {total_modified} modified, {total_upserted} upserted")
+                
+            except Exception as e:
+                print(f"⚠️ Bulk write error: {e}")
+                # Fallback: coba satu per satu
+                successful_ops = 0
+                for op in operations:
+                    try:
+                        single_result = coll.update_one(
+                            op._filter,
+                            op._doc,
+                            upsert=op._upsert
+                        )
+                        if single_result.upserted_id or single_result.modified_count:
+                            successful_ops += 1
                             if single_result.upserted_id:
                                 total_upserted += 1
-                            elif single_result.modified_count:
+                            if single_result.modified_count:
                                 total_modified += 1
-                        except Exception as single_error:
-                            errors.append(f"Individual update error: {single_error}")
-                            error_count += 1
-            
-            # Hitung ulang success_count berdasarkan hasil
-            final_count = coll.count_documents({})
-            
-            return {
-                "success": True,
-                "message": f"Bulk import completed for game '{game}'",
-                "stats": {
-                    "total_processed": len(players),
-                    "successful": success_count - error_count,
-                    "failed": error_count,
-                    "modified": total_modified,
-                    "upserted": total_upserted,
-                    "total_in_db": final_count
-                },
-                "errors": errors[:20]  # Batasi 20 error pertama
-            }
-        else:
-            return {
-                "success": False,
-                "message": "No valid operations to execute",
-                "errors": errors
-            }
+                    except Exception as single_error:
+                        errors.append(f"Individual update error: {single_error}")
+        
+        # Hitung total setelah import
+        final_count = coll.count_documents({})
+        
+        return {
+            "success": True,
+            "message": f"Bulk import completed for game '{game}'",
+            "stats": {
+                "total_received": len(players),
+                "successful_operations": successful_ops,
+                "failed_operations": len(players) - successful_ops,
+                "modified": total_modified,
+                "upserted": total_upserted,
+                "total_in_db": final_count,
+                "errors_count": len(errors)
+            },
+            "errors": errors[:20] if errors else []
+        }
             
     except HTTPException:
         raise
