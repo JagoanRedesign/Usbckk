@@ -1,15 +1,17 @@
 from fastapi import FastAPI, HTTPException, Depends, Header, Query
 from pymongo import MongoClient
+from pymongo.server_api import ServerApi  # <-- PENTING: Import ServerApi
 from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutError
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime
 from contextlib import asynccontextmanager
 import os
+import sys
 
 # ==================== KONFIGURASI LANGSUNG (HARDCODED) ====================
 # 🔴 PERINGATAN: GANTI DENGAN DATA KAMU SEBELUM DEPLOY!
-MONGO_URI = "mongodb+srv://galeh:galeh@cluster0.cq2tj1u.mongodb.net/?retryWrites=true&w=majority"
+MONGO_URI = "mongodb+srv://galeh:galeh@cluster0.cq2tj1u.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
 DB_NAME = "quiz_bot"
 COLLECTION_NAME = "players"
 API_KEY = "kunci975635885rii7"
@@ -24,13 +26,14 @@ client = None
 db = None
 collection = None
 
+print(f"🐍 Python version: {sys.version}")
+print(f"🔌 MongoDB URI: {MONGO_URI[:50]}...")
+
 # ==================== LIFESPAN CONTEXT MANAGER ====================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
     Mengelola startup dan shutdown aplikasi
-    - Startup: koneksi ke MongoDB, buat index
-    - Shutdown: tutup koneksi MongoDB
     """
     global client, db, collection
     
@@ -41,12 +44,15 @@ async def lifespan(app: FastAPI):
     
     # --- STARTUP: Koneksi MongoDB ---
     try:
-        print("🔄 Menghubungkan ke MongoDB...")
+        print("🔄 Menghubungkan ke MongoDB dengan ServerApi('1')...")
+        
+        # Gunakan ServerApi('1') untuk kompatibilitas
         client = MongoClient(
-            MONGO_URI, 
-            serverSelectionTimeoutMS=10000,  # Timeout 10 detik
-            connectTimeoutMS=10000,
-            socketTimeoutMS=30000
+            MONGO_URI,
+            server_api=ServerApi('1'),  # <-- INI KUNCI UTAMA!
+            connectTimeoutMS=30000,
+            socketTimeoutMS=30000,
+            serverSelectionTimeoutMS=30000
         )
         
         # Test koneksi dengan ping
@@ -56,18 +62,19 @@ async def lifespan(app: FastAPI):
         db = client[DB_NAME]
         collection = db[COLLECTION_NAME]
         
-        # Buat index untuk sorting poin
-        collection.create_index("points", -1)
-        collection.create_index("username")
-        collection.create_index("user_id")  # Index tambahan
-        
-        print("✅ Koneksi MongoDB berhasil!")
+        # Buat index
+        try:
+            collection.create_index("points", -1)
+            collection.create_index("username")
+            print("✅ Index berhasil dibuat")
+        except Exception as idx_err:
+            print(f"⚠️ Warning saat buat index: {idx_err}")
         
         # Hitung total pemain
         total_players = collection.count_documents({})
         print(f"📊 Total pemain saat ini: {total_players}")
         
-        # Tampilkan top 3 jika ada
+        # Tampilkan top 3
         if total_players > 0:
             top3 = list(collection.find().sort("points", -1).limit(3))
             print("🏆 Top 3 Players:")
@@ -75,20 +82,14 @@ async def lifespan(app: FastAPI):
                 name = p.get("username") or p.get("first_name") or f"Player {p['_id']}"
                 print(f"   {i}. {name}: {p['points']} poin")
         
-    except ConnectionFailure as e:
-        print(f"❌ Gagal koneksi MongoDB (ConnectionFailure): {e}")
-        print("🔍 Periksa: Apakah MongoDB Atlas mengizinkan akses dari IP Koyeb?")
-        client = None
-        db = None
-        collection = None
-    except ServerSelectionTimeoutError as e:
-        print(f"❌ Gagal koneksi MongoDB (Timeout): {e}")
-        print("🔍 Periksa: Apakah URI MongoDB benar? Apakah password mengandung karakter khusus?")
-        client = None
-        db = None
-        collection = None
+        print("✅ Koneksi MongoDB BERHASIL dengan ServerApi('1')!")
+        
     except Exception as e:
         print(f"❌ Gagal koneksi MongoDB: {type(e).__name__}: {e}")
+        print("🔍 Detail error:")
+        import traceback
+        traceback.print_exc()
+        
         client = None
         db = None
         collection = None
@@ -106,9 +107,7 @@ app = FastAPI(
     title="Quiz Bot API", 
     description="API untuk manajemen poin game kuis Telegram",
     version="1.0.0",
-    lifespan=lifespan,
-    docs_url="/docs",
-    redoc_url="/redoc"
+    lifespan=lifespan
 )
 
 # ==================== FUNGSI VERIFIKASI ====================
@@ -155,7 +154,8 @@ class HealthResponse(BaseModel):
     timestamp: str
     mongo_uri_configured: bool
     api_key_configured: bool
-    mongodb_version: Optional[str] = None
+    server_api_used: str = "1"
+    error_detail: Optional[str] = None
 
 # ==================== ENDPOINTS ====================
 
@@ -169,6 +169,7 @@ async def root():
         "version": "1.0.0",
         "status": "running",
         "database": db_status,
+        "server_api": "1",
         "timestamp": datetime.now().isoformat(),
         "endpoints": [
             {"method": "GET", "path": "/", "description": "Info API"},
@@ -179,7 +180,8 @@ async def root():
             {"method": "GET", "path": "/players", "description": "GET semua pemain"},
             {"method": "DELETE", "path": "/points/{user_id}", "description": "Reset poin pemain"},
             {"method": "GET", "path": "/stats", "description": "GET statistik umum"},
-            {"method": "GET", "path": "/top/{count}", "description": "GET N pemain teratas"}
+            {"method": "GET", "path": "/top/{count}", "description": "GET N pemain teratas"},
+            {"method": "GET", "path": "/debug/connection", "description": "Debug koneksi"}
         ]
     }
 
@@ -191,22 +193,27 @@ async def health_check():
     """
     db_status = "disconnected"
     total_players = 0
-    mongodb_version = None
+    error_detail = None
     
     try:
         if client:
-            # Coba ping
-            client.admin.command('ping')
-            db_status = "connected"
+            # Test ping
+            try:
+                client.admin.command('ping')
+                db_status = "connected"
+            except Exception as e:
+                error_detail = str(e)
+                db_status = "error"
             
-            # Ambil versi MongoDB
-            server_info = client.server_info()
-            mongodb_version = server_info.get('version', 'unknown')
-            
-            if collection:
-                total_players = collection.count_documents({})
+            if collection and db_status == "connected":
+                try:
+                    total_players = collection.count_documents({})
+                except Exception as count_err:
+                    print(f"Error count_documents: {count_err}")
+                    total_players = -1
     except Exception as e:
         print(f"Health check error: {e}")
+        error_detail = str(e)
     
     # Tentukan status keseluruhan
     overall_status = "healthy" if db_status == "connected" else "unhealthy"
@@ -218,8 +225,49 @@ async def health_check():
         "timestamp": datetime.now().isoformat(),
         "mongo_uri_configured": bool(MONGO_URI),
         "api_key_configured": bool(API_KEY),
-        "mongodb_version": mongodb_version
+        "server_api_used": "1",
+        "error_detail": error_detail
     }
+
+@app.get("/debug/connection")
+async def debug_connection(api_key: str = Depends(verify_api_key)):
+    """Endpoint debug untuk memeriksa koneksi MongoDB"""
+    debug_info = {
+        "python_version": sys.version,
+        "server_api": "1",
+        "client_exists": client is not None,
+        "db_exists": db is not None,
+        "collection_exists": collection is not None,
+        "mongodb_uri": MONGO_URI[:50] + "..." if MONGO_URI else None,
+        "database_name": DB_NAME,
+        "collection_name": COLLECTION_NAME,
+        "environment_variables": {
+            "PORT": os.environ.get("PORT", "not set"),
+            "PYTHON_VERSION": os.environ.get("PYTHON_VERSION", "not set")
+        }
+    }
+    
+    if client:
+        try:
+            # Test ping
+            ping_result = client.admin.command('ping')
+            debug_info["ping_result"] = ping_result
+            
+            # Coba list database
+            debug_info["databases"] = client.list_database_names()
+            
+            if db:
+                debug_info["collections"] = db.list_collection_names()
+                
+                if collection:
+                    debug_info["document_count"] = collection.count_documents({})
+                    
+        except Exception as e:
+            debug_info["error"] = str(e)
+            import traceback
+            debug_info["traceback"] = traceback.format_exc()
+    
+    return debug_info
 
 @app.get("/points/{user_id}", response_model=PlayerResponse)
 async def get_points(
@@ -589,78 +637,6 @@ async def get_top_players(
         print(f"❌ Error get_top_players: {e}")
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
-@app.get("/player/{user_id}/history")
-async def get_player_history(
-    user_id: int,
-    api_key: str = Depends(verify_api_key)
-):
-    """
-    Mendapatkan history permainan pemain
-    Catatan: Fitur ini membutuhkan collection terpisah 'game_history'
-    """
-    try:
-        # Cek apakah collection history ada
-        if "game_history" not in db.list_collection_names():
-            return {
-                "user_id": user_id,
-                "message": "Fitur history belum diimplementasikan. Buat collection 'game_history' untuk menyimpan history.",
-                "history": []
-            }
-        
-        history_coll = db["game_history"]
-        history = list(history_coll.find({"user_id": user_id}).sort("played_at", -1).limit(20))
-        
-        # Convert ObjectId to string
-        for h in history:
-            h["_id"] = str(h["_id"])
-        
-        return {
-            "user_id": user_id,
-            "total_games": len(history),
-            "history": history
-        }
-        
-    except Exception as e:
-        print(f"❌ Error get_player_history: {e}")
-        return {
-            "user_id": user_id,
-            "error": str(e),
-            "message": "Gagal mengambil history"
-        }
-
-@app.post("/debug/check-connection")
-async def debug_connection(api_key: str = Depends(verify_api_key)):
-    """Endpoint debug untuk memeriksa koneksi MongoDB"""
-    result = {
-        "client_exists": client is not None,
-        "db_exists": db is not None,
-        "collection_exists": collection is not None,
-        "mongodb_uri": MONGO_URI[:30] + "..." if MONGO_URI else None,
-        "database_name": DB_NAME,
-        "collection_name": COLLECTION_NAME
-    }
-    
-    if client:
-        try:
-            # Coba list database
-            databases = client.list_database_names()
-            result["databases"] = databases
-            result["current_db_exists"] = DB_NAME in databases
-            
-            if db:
-                collections = db.list_collection_names()
-                result["collections"] = collections
-                result["current_collection_exists"] = COLLECTION_NAME in collections
-                
-                if collection:
-                    count = collection.count_documents({})
-                    result["document_count"] = count
-                    
-        except Exception as e:
-            result["error"] = str(e)
-    
-    return result
-
 # ==================== RUNNER ====================
 if __name__ == "__main__":
     import uvicorn
@@ -671,5 +647,5 @@ if __name__ == "__main__":
         "main:app",
         host=HOST,
         port=PORT,
-        reload=False  # Set True untuk development
+        reload=False
     )
