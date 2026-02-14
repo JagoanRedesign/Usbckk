@@ -158,8 +158,9 @@ class BulkPlayerData(BaseModel):
     def validate_points(cls, v):
         if v is None:
             return 0
-        if v < -10000 or v > 100000:
-            raise ValueError('points out of reasonable range')
+        # Perbesar range menjadi -10 juta sampai 10 juta
+        if v < -10000000 or v > 10000000:
+            raise ValueError(f'points out of reasonable range (max 10 million): {v}')
         return v
     
     @validator('first_name', 'last_name', 'username')
@@ -247,7 +248,9 @@ async def health_check():
         "error_detail": error_detail
     }
 
-# ==================== GAME ENDPOINTS (UNCHANGED) ====================
+# ==================== ENDPOINTS PER GAME ====================
+# (Endpoint get_points, update_points, leaderboard, players, reset, stats, top tidak berubah)
+# Disertakan untuk kelengkapan
 
 @app.get("/{game}/points/{user_id}", response_model=PlayerResponse)
 async def get_points(
@@ -312,7 +315,6 @@ async def update_points(
     """Update poin pemain di game tertentu"""
     coll = get_collection(game)
     try:
-        # Siapkan operator update
         update_ops = {}
         inc_fields = {}
         if update.points != 0:
@@ -369,7 +371,6 @@ async def get_leaderboard(
     limit: int = Query(10, ge=1, le=50),
     api_key: str = Depends(verify_api_key)
 ):
-    """Mendapatkan leaderboard game tertentu"""
     coll = get_collection(game)
     try:
         cursor = coll.find().sort("points", -1).limit(limit)
@@ -400,7 +401,6 @@ async def get_all_players(
     search: Optional[str] = Query(None),
     api_key: str = Depends(verify_api_key)
 ):
-    """Mendapatkan semua pemain di game tertentu"""
     coll = get_collection(game)
     try:
         filter_query = {}
@@ -436,7 +436,6 @@ async def reset_points(
     user_id: int, 
     api_key: str = Depends(verify_api_key)
 ):
-    """Reset poin pemain ke 0 di game tertentu"""
     coll = get_collection(game)
     try:
         player = coll.find_one({"_id": user_id})
@@ -460,7 +459,6 @@ async def get_game_stats(
     game: str,
     api_key: str = Depends(verify_api_key)
 ):
-    """Mendapatkan statistik game tertentu"""
     coll = get_collection(game)
     try:
         total_players = coll.count_documents({})
@@ -515,7 +513,6 @@ async def get_top_players(
     count: int,
     api_key: str = Depends(verify_api_key)
 ):
-    """Mendapatkan N pemain teratas di game tertentu"""
     coll = get_collection(game)
     try:
         if count < 1 or count > 100:
@@ -541,201 +538,163 @@ async def get_top_players(
 @app.post("/bulk-import/{game}", response_model=BulkImportResponse)
 async def bulk_import(
     game: str,
-    players: List[BulkPlayerData],
+    players: List[dict],
     api_key: str = Depends(verify_api_key),
     mode: str = Query("add", regex="^(add|replace)$"),
     validate_only: bool = Query(False)
 ):
     """
-    IMPROVED Bulk Import dengan fitur:
-    - Validasi ketat menggunakan Pydantic
-    - Mode: 'add' (tambah poin) atau 'replace' (ganti poin)
-    - validate_only: Cek validasi tanpa menyimpan
-    - Better error handling dan reporting
-    - Deduplication otomatis
-    - Progress tracking
+    Improved Bulk Import dengan toleransi error.
+    - Menerima raw dict, memvalidasi manual.
+    - Data invalid tidak menggagalkan seluruh batch.
+    - Mengembalikan laporan error dan warning.
     """
     try:
         # ===== VALIDASI AWAL =====
-        if not players or len(players) == 0:
+        if not players:
             raise HTTPException(status_code=400, detail="No players data provided")
         
         if len(players) > 10000:
-            raise HTTPException(
-                status_code=400, 
-                detail=f"Maximum 10000 players per import. You sent {len(players)}"
-            )
+            raise HTTPException(status_code=400, detail=f"Maximum 10000 players per import. You sent {len(players)}")
         
-        # Dapatkan collection
         coll = get_collection(game)
         
+        # ===== VALIDASI MANUAL =====
+        valid_players = []
+        errors = []
+        warnings = []
+        
+        for idx, p in enumerate(players):
+            try:
+                # Validasi menggunakan Pydantic
+                player = BulkPlayerData(**p)
+                valid_players.append(player)
+            except Exception as e:
+                errors.append(f"Row {idx}: {str(e)}")
+        
+        print(f"📥 Received {len(players)} records, valid: {len(valid_players)}, errors: {len(errors)}")
+        
+        # Jika hanya validasi, kembalikan hasil
+        if validate_only:
+            return {
+                "success": len(errors) == 0,
+                "message": f"Validation: {len(valid_players)} valid, {len(errors)} errors",
+                "stats": {
+                    "total_received": len(players),
+                    "valid": len(valid_players),
+                    "errors": len(errors)
+                },
+                "errors": errors[:50],
+                "warnings": []
+            }
+        
         # ===== DEDUPLICATION =====
-        print(f"📥 Received {len(players)} records")
         seen_ids = {}
         deduplicated = []
         duplicates = []
         
-        for idx, player in enumerate(players):
+        for player in valid_players:
             user_id = player.user_id
             if user_id in seen_ids:
-                duplicates.append(f"Row {idx}: Duplicate user_id {user_id} (first seen at row {seen_ids[user_id]})")
-                # Merge points if duplicate
+                duplicates.append(f"Duplicate user_id {user_id}")
+                # Merge points if duplicate (add mode)
                 for p in deduplicated:
                     if p.user_id == user_id:
                         p.points += player.points
                         break
             else:
-                seen_ids[user_id] = idx
+                seen_ids[user_id] = True
                 deduplicated.append(player)
         
         print(f"✅ After deduplication: {len(deduplicated)} unique players")
         
-        # ===== VALIDATION ONLY MODE =====
-        if validate_only:
-            return {
-                "success": True,
-                "message": "Validation passed (no data saved)",
-                "stats": {
-                    "total_received": len(players),
-                    "unique_players": len(deduplicated),
-                    "duplicates_found": len(duplicates),
-                    "validation_only": True
-                },
-                "errors": [],
-                "warnings": duplicates[:50]
-            }
-        
-        # ===== PREPARE BULK OPERATIONS =====
+        # ===== PREPARE OPERATIONS =====
         operations = []
-        warnings = []
         now = datetime.now()
         
         for player in deduplicated:
-            try:
-                # Sanitasi data
-                first_name = player.first_name.strip() if player.first_name else ""
-                last_name = player.last_name.strip() if player.last_name else ""
-                username = player.username.strip() if player.username else ""
-                
-                # Default name jika kosong
-                if not first_name and not username:
-                    first_name = f"Player_{player.user_id}"
-                    warnings.append(f"user_id {player.user_id}: No name provided, using default")
-                
-                # Pilih mode operasi
-                if mode == "replace":
-                    # MODE REPLACE: Ganti poin (overwrite)
-                    operations.append(
-                        UpdateOne(
-                            {"_id": player.user_id},
-                            {
-                                "$set": {
-                                    "points": player.points,
-                                    "first_name": first_name,
-                                    "last_name": last_name,
-                                    "username": username,
-                                    "language_code": player.language_code,
-                                    "updated_at": now,
-                                    "imported_from_sheet": True
-                                },
-                                "$setOnInsert": {
-                                    "created_at": now,
-                                    "total_games": 0,
-                                    "correct_answers": 0
-                                }
+            # Sanitasi data
+            first_name = player.first_name.strip() if player.first_name else ""
+            last_name = player.last_name.strip() if player.last_name else ""
+            username = player.username.strip() if player.username else ""
+            
+            if not first_name and not username:
+                first_name = f"Player_{player.user_id}"
+                warnings.append(f"user_id {player.user_id}: No name provided, using default")
+            
+            if mode == "replace":
+                operations.append(
+                    UpdateOne(
+                        {"_id": player.user_id},
+                        {
+                            "$set": {
+                                "points": player.points,
+                                "first_name": first_name,
+                                "last_name": last_name,
+                                "username": username,
+                                "language_code": player.language_code,
+                                "updated_at": now,
+                                "imported_from_sheet": True
                             },
-                            upsert=True
-                        )
+                            "$setOnInsert": {
+                                "created_at": now,
+                                "total_games": 0,
+                                "correct_answers": 0
+                            }
+                        },
+                        upsert=True
                     )
-                else:
-                    # MODE ADD: Tambah poin (default)
-                    operations.append(
-                        UpdateOne(
-                            {"_id": player.user_id},
-                            {
-                                "$set": {
-                                    "first_name": first_name,
-                                    "last_name": last_name,
-                                    "username": username,
-                                    "language_code": player.language_code,
-                                    "updated_at": now,
-                                    "imported_from_sheet": True
-                                },
-                                "$inc": {
-                                    "points": player.points
-                                },
-                                "$setOnInsert": {
-                                    "created_at": now,
-                                    "total_games": 0,
-                                    "correct_answers": 0
-                                }
+                )
+            else:  # mode "add"
+                operations.append(
+                    UpdateOne(
+                        {"_id": player.user_id},
+                        {
+                            "$set": {
+                                "first_name": first_name,
+                                "last_name": last_name,
+                                "username": username,
+                                "language_code": player.language_code,
+                                "updated_at": now,
+                                "imported_from_sheet": True
                             },
-                            upsert=True
-                        )
+                            "$inc": {"points": player.points},
+                            "$setOnInsert": {
+                                "created_at": now,
+                                "total_games": 0,
+                                "correct_answers": 0
+                            }
+                        },
+                        upsert=True
                     )
-                
-            except Exception as e:
-                warnings.append(f"user_id {player.user_id}: Failed to prepare - {str(e)}")
+                )
         
         print(f"📦 Prepared {len(operations)} operations")
         
-        # ===== EXECUTE BULK WRITE =====
+        # ===== EKSEKUSI BULK WRITE =====
         total_modified = 0
         total_upserted = 0
         total_matched = 0
-        errors = []
+        bulk_errors = []
         
         if operations:
             try:
-                # Execute dengan ordered=False untuk melanjutkan meski ada error
                 result = coll.bulk_write(operations, ordered=False)
-                
                 total_modified = result.modified_count
                 total_upserted = result.upserted_count
                 total_matched = result.matched_count
-                
                 print(f"✅ Bulk write SUCCESS!")
-                print(f"   - Matched: {total_matched}")
-                print(f"   - Modified: {total_modified}")
-                print(f"   - Upserted: {total_upserted}")
-                
             except BulkWriteError as bwe:
-                # Tangani partial success
                 total_modified = bwe.details.get('nModified', 0)
                 total_upserted = bwe.details.get('nUpserted', 0)
                 total_matched = bwe.details.get('nMatched', 0)
-                
                 write_errors = bwe.details.get('writeErrors', [])
-                for err in write_errors[:20]:  # Limit error reporting
-                    errors.append(f"Index {err['index']}: {err.get('errmsg', 'Unknown error')}")
-                
+                for err in write_errors[:20]:
+                    bulk_errors.append(f"Index {err['index']}: {err.get('errmsg', 'Unknown')}")
                 print(f"⚠️ Bulk write PARTIAL SUCCESS")
-                print(f"   - Matched: {total_matched}")
-                print(f"   - Modified: {total_modified}")
-                print(f"   - Upserted: {total_upserted}")
-                print(f"   - Errors: {len(write_errors)}")
-                
             except Exception as e:
-                print(f"❌ Bulk write FAILED: {e}")
-                errors.append(f"Bulk write error: {str(e)}")
-                
-                # Fallback: Try one by one (untuk data yang sedikit)
-                if len(operations) <= 100:
-                    print("🔄 Trying fallback: individual updates...")
-                    for idx, op in enumerate(operations):
-                        try:
-                            single_result = coll.update_one(
-                                op._filter,
-                                op._doc,
-                                upsert=op._upsert
-                            )
-                            if single_result.upserted_id:
-                                total_upserted += 1
-                            elif single_result.modified_count:
-                                total_modified += 1
-                            total_matched += 1
-                        except Exception as single_err:
-                            errors.append(f"Index {idx}: {str(single_err)}")
+                bulk_errors.append(f"Bulk write error: {str(e)}")
+                print(f"❌ Bulk write FAILED")
         
         # ===== FINAL COUNT =====
         final_count = coll.count_documents({})
@@ -743,36 +702,28 @@ async def bulk_import(
         failed = len(deduplicated) - successful
         
         # ===== SUMMARY =====
-        success = (failed == 0) or (successful > len(deduplicated) * 0.95)  # 95% success rate
-        
-        message = f"Bulk import completed for game '{game}'"
-        if mode == "replace":
-            message += " (REPLACE mode - points overwritten)"
-        else:
-            message += " (ADD mode - points added)"
-        
         return {
-            "success": success,
-            "message": message,
+            "success": failed == 0,
+            "message": f"Bulk import completed for game '{game}'",
             "stats": {
                 "mode": mode,
                 "total_received": len(players),
-                "unique_players": len(deduplicated),
-                "duplicates_removed": len(players) - len(deduplicated),
-                "operations_prepared": len(operations),
+                "valid": len(valid_players),
+                "invalid": len(errors),
+                "unique": len(deduplicated),
+                "duplicates_removed": len(valid_players) - len(deduplicated),
+                "operations": len(operations),
                 "successful_operations": successful,
                 "failed_operations": failed,
                 "matched": total_matched,
                 "modified": total_modified,
                 "upserted": total_upserted,
-                "total_in_db": final_count,
-                "errors_count": len(errors),
-                "warnings_count": len(warnings)
+                "total_in_db": final_count
             },
-            "errors": errors[:50] if errors else [],
-            "warnings": warnings[:50] if warnings else []
+            "errors": (errors + bulk_errors)[:50],
+            "warnings": warnings[:50]
         }
-            
+        
     except HTTPException:
         raise
     except Exception as e:
