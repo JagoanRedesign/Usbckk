@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, Depends, Header, Query
 from pymongo import MongoClient
-from pymongo.server_api import ServerApi
+from pymongo.errors import ConnectionFailure
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime
@@ -37,23 +37,33 @@ async def lifespan(app: FastAPI):
     print(f"🔑 API Key: {'✅ Tersedia' if API_KEY else '❌ Tidak ada'}")
 
     try:
-        print("🔄 Menghubungkan ke MongoDB dengan ServerApi('1')...")
+        print("🔄 Menghubungkan ke MongoDB...")
+        # Gunakan pymongo 3.12.3 tanpa ServerApi
         client = MongoClient(
             MONGO_URI,
-            server_api=ServerApi('1'),
             connectTimeoutMS=30000,
             socketTimeoutMS=30000,
             serverSelectionTimeoutMS=30000
         )
+        # Test koneksi dengan ping
         client.admin.command('ping')
         print("✅ Ping MongoDB berhasil!")
 
         db = client[DB_NAME]
         collection = db[COLLECTION_NAME]
 
-        collection.create_index("points", -1)
-        collection.create_index("username")
-        print("✅ Index berhasil dibuat")
+        # Buat index dengan try-except terpisah (jika gagal, tidak menghentikan startup)
+        try:
+            collection.create_index("points", -1)
+            print("✅ Index 'points' berhasil dibuat")
+        except Exception as idx_err:
+            print(f"⚠️ Gagal membuat index points: {idx_err}")
+
+        try:
+            collection.create_index("username")
+            print("✅ Index 'username' berhasil dibuat")
+        except Exception as idx_err:
+            print(f"⚠️ Gagal membuat index username: {idx_err}")
 
         total_players = collection.count_documents({})
         print(f"📊 Total pemain saat ini: {total_players}")
@@ -98,7 +108,10 @@ def verify_api_key(api_key: str = Header(...)):
 
 def get_collection():
     if collection is None:
-        raise HTTPException(status_code=503, detail="Database connection not available")
+        raise HTTPException(
+            status_code=503, 
+            detail="Database connection not available. Please check /health endpoint."
+        )
     return collection
 
 # ==================== MODEL DATA ====================
@@ -127,7 +140,6 @@ class HealthResponse(BaseModel):
     timestamp: str
     mongo_uri_configured: bool
     api_key_configured: bool
-    server_api_used: str = "1"
     error_detail: Optional[str] = None
 
 # ==================== ENDPOINTS ====================
@@ -140,7 +152,6 @@ async def root():
         "version": "1.0.0",
         "status": "running",
         "database": db_status,
-        "server_api": "1",
         "timestamp": datetime.now().isoformat(),
         "endpoints": [
             {"method": "GET", "path": "/", "description": "Info API"},
@@ -189,7 +200,6 @@ async def health_check():
         "timestamp": datetime.now().isoformat(),
         "mongo_uri_configured": bool(MONGO_URI),
         "api_key_configured": bool(API_KEY),
-        "server_api_used": "1",
         "error_detail": error_detail
     }
 
@@ -197,7 +207,6 @@ async def health_check():
 async def debug_connection(api_key: str = Depends(verify_api_key)):
     debug_info = {
         "python_version": sys.version,
-        "server_api": "1",
         "client_exists": client is not None,
         "db_exists": db is not None,
         "collection_exists": collection is not None,
@@ -271,10 +280,8 @@ async def get_points(user_id: int, api_key: str = Depends(verify_api_key)):
 async def update_points(update: PointUpdate, api_key: str = Depends(verify_api_key)):
     coll = get_collection()
     try:
-        # Siapkan operator update
+        # Siapkan operator update secara eksplisit
         update_ops = {}
-
-        # $inc untuk poin dan statistik
         inc_fields = {}
         if update.points != 0:
             inc_fields["points"] = update.points
@@ -284,7 +291,6 @@ async def update_points(update: PointUpdate, api_key: str = Depends(verify_api_k
         if inc_fields:
             update_ops["$inc"] = inc_fields
 
-        # $set untuk profil dan timestamp
         set_fields = {"updated_at": datetime.now()}
         if update.first_name:
             set_fields["first_name"] = update.first_name
@@ -297,10 +303,9 @@ async def update_points(update: PointUpdate, api_key: str = Depends(verify_api_k
         if set_fields:
             update_ops["$set"] = set_fields
 
-        # $setOnInsert untuk created_at
+        # $setOnInsert hanya untuk created_at (total_games & correct_answers akan di-$inc)
         update_ops["$setOnInsert"] = {"created_at": datetime.now()}
 
-        # Eksekusi
         result = coll.update_one(
             {"_id": update.user_id},
             update_ops,
