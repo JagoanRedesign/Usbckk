@@ -1,0 +1,205 @@
+// ==================== KONFIGURASI ====================
+const CONFIG = {
+  API_URL: 'https://vivid-sydelle-jamaa-c03b69c9.koyeb.app',
+  API_KEY: 'kunci975635885rii7',
+  GAME_NAME: 'susunkata',
+  SHEET_ID: '14yci2PN7PzwmTG-x-hN2Ek3laiBmrA0iiav2EBFEO1U',
+  SHEET_NAME: 'Leaderboard',
+  START_ROW: 2,
+  COL_USER_ID: 1,
+  COL_NAMA: 2,
+  COL_POIN: 3,
+  BATCH_SIZE: 4500, // Lebih kecil dari batas API (5000)
+  DELAY_MS: 1000,   // Jeda 1 detik antar batch
+};
+
+// ==================== FUNGSI UTAMA ====================
+function importBatchToAPI() {
+  try {
+    Logger.log('📤 Membaca data dari sheet...');
+    const allPlayers = readSheet();
+    const total = allPlayers.length;
+    Logger.log(`✅ Total ${total} pemain`);
+    
+    // Hitung jumlah batch
+    const batchCount = Math.ceil(total / CONFIG.BATCH_SIZE);
+    Logger.log(`📦 Akan diproses dalam ${batchCount} batch`);
+    
+    let successCount = 0;
+    let failedCount = 0;
+    let totalProcessed = 0;
+    
+    // Proses per batch
+    for (let i = 0; i < total; i += CONFIG.BATCH_SIZE) {
+      const batch = allPlayers.slice(i, i + CONFIG.BATCH_SIZE);
+      const batchNum = Math.floor(i / CONFIG.BATCH_SIZE) + 1;
+      
+      Logger.log(`\n📦 Batch ${batchNum}/${batchCount}: ${batch.length} pemain`);
+      
+      try {
+        const result = sendBatchToAPI(batch, batchNum);
+        
+        if (result.success) {
+          successCount += batch.length;
+          totalProcessed += batch.length;
+          Logger.log(`✅ Batch ${batchNum} sukses`);
+          
+          if (result.stats) {
+            Logger.log(`   Modified: ${result.stats.modified || 0}`);
+            Logger.log(`   Upserted: ${result.stats.upserted || 0}`);
+          }
+        } else {
+          failedCount += batch.length;
+          Logger.log(`❌ Batch ${batchNum} gagal`);
+        }
+        
+      } catch (e) {
+        failedCount += batch.length;
+        Logger.log(`❌ Batch ${batchNum} error: ${e.toString()}`);
+      }
+      
+      // Jeda antar batch (kecuali batch terakhir)
+      if (i + CONFIG.BATCH_SIZE < total) {
+        Logger.log(`⏱️ Jeda ${CONFIG.DELAY_MS/1000} detik...`);
+        Utilities.sleep(CONFIG.DELAY_MS);
+      }
+    }
+    
+    // Tampilkan ringkasan
+    Logger.log('\n' + '='.repeat(50));
+    Logger.log('📊 RINGKASAN IMPORT');
+    Logger.log('='.repeat(50));
+    Logger.log(`✅ Sukses: ${successCount} pemain`);
+    Logger.log(`❌ Gagal: ${failedCount} pemain`);
+    Logger.log(`📦 Total batch: ${batchCount}`);
+    Logger.log('='.repeat(50));
+    
+    // Cek hasil akhir
+    checkFinalStatus();
+    
+  } catch (e) {
+    Logger.log('❌ Fatal error: ' + e.toString());
+  }
+}
+
+// ==================== KIRIM BATCH KE API ====================
+function sendBatchToAPI(batch, batchNum) {
+  const url = `${CONFIG.API_URL}/bulk-import/${CONFIG.GAME_NAME}`;
+  
+  Logger.log(`📤 Mengirim batch ${batchNum} (${batch.length} pemain)...`);
+  
+  const options = {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'api-key': CONFIG.API_KEY
+    },
+    payload: JSON.stringify(batch),
+    muteHttpExceptions: true,
+    timeout: 300000 // 5 menit
+  };
+  
+  const response = UrlFetchApp.fetch(url, options);
+  const code = response.getResponseCode();
+  const responseText = response.getContentText();
+  
+  if (code === 200) {
+    return JSON.parse(responseText);
+  } else {
+    throw new Error(`HTTP ${code}: ${responseText}`);
+  }
+}
+
+// ==================== BACA SHEET ====================
+function readSheet() {
+  const ss = SpreadsheetApp.openById(CONFIG.SHEET_ID);
+  const sheet = ss.getSheetByName(CONFIG.SHEET_NAME);
+  
+  if (!sheet) {
+    throw new Error('Sheet "' + CONFIG.SHEET_NAME + '" tidak ditemukan');
+  }
+  
+  const lastRow = sheet.getLastRow();
+  Logger.log(`📊 Sheet: ${lastRow - CONFIG.START_ROW + 1} baris data`);
+  
+  const data = sheet.getRange(
+    CONFIG.START_ROW, 1,
+    lastRow - CONFIG.START_ROW + 1,
+    3
+  ).getValues();
+  
+  const players = [];
+  let skipped = 0;
+  
+  for (let i = 0; i < data.length; i++) {
+    const row = data[i];
+    const userId = row[0];
+    const nama = row[1];
+    const poin = row[2];
+    
+    if (userId && userId.toString().trim()) {
+      players.push({
+        user_id: Number(userId.toString().replace(/\D/g, '')) || 0,
+        first_name: (nama || '').toString().trim() || 'Player_' + userId,
+        points: Number(poin) || 0
+      });
+    } else {
+      skipped++;
+    }
+  }
+  
+  Logger.log(`✅ Data valid: ${players.length} pemain`);
+  Logger.log(`⚠️ Dilewati: ${skipped} baris`);
+  
+  return players;
+}
+
+// ==================== CEK STATUS AKHIR ====================
+function checkFinalStatus() {
+  try {
+    const url = `${CONFIG.API_URL}/bulk-import/${CONFIG.GAME_NAME}/status`;
+    
+    const options = {
+      headers: { 'api-key': CONFIG.API_KEY },
+      muteHttpExceptions: true
+    };
+    
+    const response = UrlFetchApp.fetch(url, options);
+    const data = JSON.parse(response.getContentText());
+    
+    Logger.log('\n📊 STATUS AKHIR DATABASE:');
+    Logger.log(`👥 Total pemain: ${data.total_players}`);
+    
+    if (data.top_5 && data.top_5.length > 0) {
+      Logger.log('\n🏆 TOP 5 PLAYERS:');
+      data.top_5.forEach((p, i) => {
+        Logger.log(`   ${i+1}. ${p.name}: ${p.points} poin`);
+      });
+    }
+    
+  } catch (e) {
+    Logger.log('❌ Gagal cek status: ' + e.toString());
+  }
+}
+
+// ==================== TEST KONEKSI ====================
+function testKoneksi() {
+  try {
+    const url = CONFIG.API_URL + '/health';
+    const response = UrlFetchApp.fetch(url);
+    const data = JSON.parse(response.getContentText());
+    
+    Logger.log('✅ KONEKSI API OK');
+    Logger.log(`🌐 URL: ${CONFIG.API_URL}`);
+    Logger.log('📊 GAME STATUS:');
+    
+    if (data.games) {
+      for (const [game, count] of Object.entries(data.games)) {
+        Logger.log(`   • ${game}: ${count} pemain`);
+      }
+    }
+    
+  } catch (e) {
+    Logger.log('❌ Gagal: ' + e.toString());
+  }
+}
